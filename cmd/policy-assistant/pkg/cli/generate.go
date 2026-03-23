@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/mattfenwick/collections/pkg/json"
 	"github.com/sirupsen/logrus"
@@ -30,6 +31,7 @@ type GenerateArgs struct {
 	PerturbationWaitSeconds   int
 	PodCreationTimeoutSeconds int
 	Retries                   int
+	ParallelWorkers           int
 	Context                   string
 	ServerPorts               []int
 	ServerProtocols           []string
@@ -88,7 +90,48 @@ func SetupGenerateCommand() *cobra.Command {
 	command.Flags().StringVar(&args.JunitResultsFile, "junit-results-file", "", "output junit results to the specified file")
 	command.Flags().StringVar(&args.ImageRegistry, "image-registry", "registry.k8s.io", "Image registry for agnhost")
 
+	command.Flags().IntVar(&args.ParallelWorkers, "parallel-workers", 1, "number of parallel test workers; each worker gets its own set of namespaces and pods")
+
 	return command
+}
+
+// workerNamespaceSuffix returns the namespace suffix for a given worker ID.
+// Worker 0 gets no suffix (uses original namespace names).
+func workerNamespaceSuffix(workerID int) string {
+	if workerID == 0 {
+		return ""
+	}
+	return fmt.Sprintf("-w%d", workerID)
+}
+
+// workerNamespaces returns the namespace names for a given worker.
+func workerNamespaces(workerID int, baseNamespaces []string) []string {
+	suffix := workerNamespaceSuffix(workerID)
+	result := make([]string, len(baseNamespaces))
+	for i, ns := range baseNamespaces {
+		result[i] = ns + suffix
+	}
+	return result
+}
+
+// workerNamespaceLabels builds a labels map for a worker's namespaces.
+// Each worker namespace gets the same labels as the corresponding base namespace
+// (e.g., x-w1 gets {"ns": "x"}) so that policy namespace selectors match correctly.
+func workerNamespaceLabels(workerID int, baseNamespaces []string) map[string]map[string]string {
+	if workerID == 0 {
+		return nil // use default labels
+	}
+	suffix := workerNamespaceSuffix(workerID)
+	labels := make(map[string]map[string]string, len(baseNamespaces))
+	for _, ns := range baseNamespaces {
+		labels[ns+suffix] = map[string]string{"ns": ns}
+	}
+	return labels
+}
+
+type indexedResult struct {
+	Index  int
+	Result *connectivity.Result
 }
 
 func RunGenerateCommand(args *GenerateArgs) {
@@ -115,27 +158,43 @@ func RunGenerateCommand(args *GenerateArgs) {
 	serverProtocols := parseProtocols(args.ServerProtocols)
 
 	batchJobs := false // args.BatchJobs
-	resources, err := probe.NewDefaultResources(kubernetes, args.ServerNamespaces, args.ServerPods, args.ServerPorts, serverProtocols, externalIPs, args.PodCreationTimeoutSeconds, batchJobs, args.ImageRegistry)
-	utils.DoOrDie(err)
 
-	interpreterConfig := &connectivity.InterpreterConfig{
-		ResetClusterBeforeTestCase:       true,
-		KubeProbeRetries:                 args.Retries,
-		PerturbationWaitSeconds:          args.PerturbationWaitSeconds,
-		VerifyClusterStateBeforeTestCase: true,
-		BatchJobs:                        batchJobs,
-		IgnoreLoopback:                   args.IgnoreLoopback,
-		JobTimeoutSeconds:                args.JobTimeoutSeconds,
-		FailFast:                         args.FailFast,
-	}
-	interpreter := connectivity.NewInterpreter(kubernetes, resources, interpreterConfig)
-	printer := &connectivity.Printer{
-		Noisy:            args.Noisy,
-		IgnoreLoopback:   args.IgnoreLoopback,
-		JunitResultsFile: args.JunitResultsFile,
+	numWorkers := args.ParallelWorkers
+	if numWorkers < 1 {
+		numWorkers = 1
 	}
 
-	zcPod, err := resources.GetPod("z", "c")
+	// Create resources for all workers (in parallel to speed up pod scheduling)
+	allResources := make([]*probe.Resources, numWorkers)
+	if numWorkers == 1 {
+		resources, err := probe.NewDefaultResources(kubernetes, args.ServerNamespaces, args.ServerPods, args.ServerPorts, serverProtocols, externalIPs, args.PodCreationTimeoutSeconds, batchJobs, args.ImageRegistry)
+		utils.DoOrDie(err)
+		allResources[0] = resources
+	} else {
+		var mu sync.Mutex
+		var firstErr error
+		var wg sync.WaitGroup
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+				wns := workerNamespaces(workerID, args.ServerNamespaces)
+				nsLabels := workerNamespaceLabels(workerID, args.ServerNamespaces)
+				res, err := probe.NewDefaultResourcesWithLabels(kubernetes, wns, args.ServerPods, args.ServerPorts, serverProtocols, externalIPs, args.PodCreationTimeoutSeconds, batchJobs, args.ImageRegistry, nsLabels)
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil && firstErr == nil {
+					firstErr = err
+				}
+				allResources[workerID] = res
+			}(w)
+		}
+		wg.Wait()
+		utils.DoOrDie(firstErr)
+	}
+
+	// Use worker 0's resources (original namespace names) for test case generation
+	zcPod, err := allResources[0].GetPod(args.ServerNamespaces[len(args.ServerNamespaces)-1], args.ServerPods[len(args.ServerPods)-1])
 	utils.DoOrDie(err)
 
 	testCaseGenerator := generator.NewTestCaseGenerator(args.AllowDNS, zcPod.IP, args.ServerNamespaces, args.Include, args.Exclude)
@@ -145,7 +204,7 @@ func RunGenerateCommand(args *GenerateArgs) {
 	for tag, count := range generator.CountTestCasesByTag(testCases) {
 		fmt.Printf("- %s: %d\n", tag, count)
 	}
-	fmt.Printf("testing %d cases\n\n", len(testCases))
+	fmt.Printf("testing %d cases with %d parallel workers\n\n", len(testCases), numWorkers)
 	for i, testCase := range testCases {
 		fmt.Printf("test #%d: %s\n - tags: %+v\n", i+1, testCase.Description, strings.Join(testCase.Tags.Keys(), ", "))
 	}
@@ -164,29 +223,117 @@ func RunGenerateCommand(args *GenerateArgs) {
 		}
 	}
 
-	for i, testCase := range testCases {
-		fmt.Printf("starting test case #%d\n", i+1)
+	interpreterConfig := &connectivity.InterpreterConfig{
+		ResetClusterBeforeTestCase:       true,
+		KubeProbeRetries:                 args.Retries,
+		PerturbationWaitSeconds:          args.PerturbationWaitSeconds,
+		VerifyClusterStateBeforeTestCase: true,
+		BatchJobs:                        batchJobs,
+		IgnoreLoopback:                   args.IgnoreLoopback,
+		JobTimeoutSeconds:                args.JobTimeoutSeconds,
+		FailFast:                         args.FailFast,
+	}
 
-		result := interpreter.ExecuteTestCase(testCase)
+	// Create an interpreter per worker
+	interpreters := make([]*connectivity.Interpreter, numWorkers)
+	for w := 0; w < numWorkers; w++ {
+		interpreters[w] = connectivity.NewInterpreter(kubernetes, allResources[w], interpreterConfig)
+	}
+
+	printer := &connectivity.Printer{
+		Noisy:            args.Noisy,
+		IgnoreLoopback:   args.IgnoreLoopback,
+		JunitResultsFile: args.JunitResultsFile,
+	}
+
+	// Distribute test cases to workers via a channel
+	type indexedTestCase struct {
+		Index    int
+		TestCase *generator.TestCase
+	}
+
+	testCaseChan := make(chan indexedTestCase, len(testCases))
+	for i, tc := range testCases {
+		testCaseChan <- indexedTestCase{Index: i, TestCase: tc}
+	}
+	close(testCaseChan)
+
+	resultChan := make(chan indexedResult, len(testCases))
+
+	var failFastOnce sync.Once
+	failFastChan := make(chan struct{})
+
+	var workerWg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		workerWg.Add(1)
+		go func(workerID int) {
+			defer workerWg.Done()
+			suffix := workerNamespaceSuffix(workerID)
+			interp := interpreters[workerID]
+
+			for itc := range testCaseChan {
+				// Check if fail-fast has been triggered
+				select {
+				case <-failFastChan:
+					return
+				default:
+				}
+
+				logrus.Infof("worker %d: starting test case #%d: %s", workerID, itc.Index+1, itc.TestCase.Description)
+
+				remapped := itc.TestCase.RemapNamespaces(suffix)
+				result := interp.ExecuteTestCase(remapped)
+				// Store original test case for display (description/tags don't have namespace names)
+				result.TestCase = itc.TestCase
+
+				resultChan <- indexedResult{
+					Index:  itc.Index,
+					Result: result,
+				}
+			}
+		}(w)
+	}
+
+	// Close results channel when all workers finish
+	go func() {
+		workerWg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results from workers
+	orderedResults := make([]*connectivity.Result, len(testCases))
+	for ir := range resultChan {
+		orderedResults[ir.Index] = ir.Result
+
+		if args.FailFast && !ir.Result.Passed(interpreterConfig.IgnoreLoopback) {
+			logrus.Warn("failing fast due to failure")
+			failFastOnce.Do(func() { close(failFastChan) })
+		}
+	}
+
+	// Print results in test-case index order
+	for i, result := range orderedResults {
+		if result == nil {
+			continue // skipped due to fail-fast
+		}
+		fmt.Printf("completed test case #%d\n", i+1)
+
 		utils.DoOrDie(result.Err)
 
 		printer.PrintTestCaseResult(result)
-		fmt.Printf("finished policy #%d\n", i+1)
-
-		if args.FailFast && !result.Passed(interpreter.Config.IgnoreLoopback) {
-			logrus.Warn("failing fast due to failure")
-			break
-		}
+		fmt.Printf("finished test case #%d\n\n", i+1)
 	}
 
 	printer.PrintSummary()
 
 	if args.CleanupNamespaces {
-		for _, ns := range args.ServerNamespaces {
-			logrus.Infof("cleaning up namespace %s", ns)
-			err = kubernetes.DeleteNamespace(ns)
-			if err != nil {
-				logrus.Warnf("%+v", err)
+		for w := 0; w < numWorkers; w++ {
+			for _, ns := range workerNamespaces(w, args.ServerNamespaces) {
+				logrus.Infof("cleaning up namespace %s", ns)
+				err = kubernetes.DeleteNamespace(ns)
+				if err != nil {
+					logrus.Warnf("%+v", err)
+				}
 			}
 		}
 	}

@@ -36,6 +36,34 @@ func NewTestCase(description string, tags StringSet, steps ...*TestStep) *TestCa
 	}
 }
 
+// RemapNamespaces returns a copy of the TestCase with all namespace name references
+// transformed by appending the given suffix. If suffix is empty, the original is returned.
+// This is used for parallel test workers where each worker operates on its own set of namespaces.
+func (t *TestCase) RemapNamespaces(suffix string) *TestCase {
+	if suffix == "" {
+		return t
+	}
+	remap := func(ns string) string {
+		return ns + suffix
+	}
+	newSteps := make([]*TestStep, len(t.Steps))
+	for i, step := range t.Steps {
+		newActions := make([]*Action, len(step.Actions))
+		for j, action := range step.Actions {
+			newActions[j] = action.RemapNamespaces(remap)
+		}
+		newSteps[i] = &TestStep{
+			Probe:   step.Probe,
+			Actions: newActions,
+		}
+	}
+	return &TestCase{
+		Description: t.Description,
+		Tags:        t.Tags,
+		Steps:       newSteps,
+	}
+}
+
 func (t *TestCase) collectActionsAndPolicies() (map[string]bool, []*networkingv1.NetworkPolicy) {
 	features := map[string]bool{}
 	var policies []*networkingv1.NetworkPolicy

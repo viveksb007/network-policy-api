@@ -21,6 +21,14 @@ type Resources struct {
 }
 
 func NewDefaultResources(kubernetes kube.IKubernetes, namespaces []string, podNames []string, ports []int, protocols []v1.Protocol, externalIPs []string, podCreationTimeoutSeconds int, batchJobs bool, imageRegistry string) (*Resources, error) {
+	return NewDefaultResourcesWithLabels(kubernetes, namespaces, podNames, ports, protocols, externalIPs, podCreationTimeoutSeconds, batchJobs, imageRegistry, nil)
+}
+
+// NewDefaultResourcesWithLabels is like NewDefaultResources but allows overriding namespace labels.
+// If namespaceLabels is non-nil, the provided labels are used instead of the default {"ns": <name>}.
+// This is used for parallel test workers where namespaces have different names but must share
+// the same labels so that policy selectors match correctly.
+func NewDefaultResourcesWithLabels(kubernetes kube.IKubernetes, namespaces []string, podNames []string, ports []int, protocols []v1.Protocol, externalIPs []string, podCreationTimeoutSeconds int, batchJobs bool, imageRegistry string, namespaceLabels map[string]map[string]string) (*Resources, error) {
 	//sort.Strings(externalIPs) // TODO why is this here?
 
 	r := &Resources{
@@ -34,7 +42,15 @@ func NewDefaultResources(kubernetes kube.IKubernetes, namespaces []string, podNa
 		for _, podName := range podNames {
 			r.Pods = append(r.Pods, NewDefaultPod(ns, podName, ports, protocols, batchJobs, imageRegistry))
 		}
-		r.Namespaces[ns] = map[string]string{"ns": ns}
+		if namespaceLabels != nil {
+			if labels, ok := namespaceLabels[ns]; ok {
+				r.Namespaces[ns] = labels
+			} else {
+				r.Namespaces[ns] = map[string]string{"ns": ns}
+			}
+		} else {
+			r.Namespaces[ns] = map[string]string{"ns": ns}
+		}
 	}
 
 	if err := r.CreateResourcesInKube(kubernetes); err != nil {
